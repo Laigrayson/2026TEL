@@ -1,0 +1,910 @@
+/* ============================================================
+ *  整合控制程式：麥克納姆輪底盤 + 無刷馬達 ×2 + 伺服馬達
+ *  板子：Raspberry Pi Pico (RP2040)
+ *  核心：arduino-pico (earlephilhower) / PlatformIO
+ *  ------------------------------------------------------------
+ *  三個子系統
+ *    1. 底盤：4 顆有刷馬達（PWM + DIR），麥克納姆輪全向移動
+ *             支援 前後 / 左右平移 / 斜向 / 原地旋轉
+ *    2. 無刷：2 顆 SkyWalker 40A V2 ESC（THR 油門 + REV 方向）
+ *             含方向切換保護與油門斜率
+ *    3. 伺服：俯仰角 0~180°
+ *
+ *  控制來源（兩者並存，互不干擾）
+ *    A. USB Serial Monitor —— 目前主要操作方式：單鍵直接控制
+ *    B. 外部 UART TX/RX    —— 保留給另一顆 MCU / 遙控接收機
+ *       GP0 = TX, GP1 = RX, 115200 8N1，換行結尾的文字指令
+ *
+ *  USB 端也可以測試 UART 指令：行首加一個冒號，例如輸入
+ *      :M 0.5 0.0 0.0
+ *  就會用同一套文字協定解析。
+ *
+ *  ★ 完整接線與指令表請看 README.md，或開機後按 h。★
+ * ============================================================ */
+
+#include <Arduino.h>
+#include <Servo.h>
+
+// ============================================================
+//  1. 接線腳位
+// ============================================================
+// --- 底盤 4 顆有刷馬達（PWM = 速度, DIR = 方向）---
+constexpr uint8_t PIN_FL_PWM = 2; // 左前 PWM
+constexpr uint8_t PIN_FL_DIR = 3; // 左前 方向
+constexpr uint8_t PIN_FR_PWM = 4; // 右前 PWM
+constexpr uint8_t PIN_FR_DIR = 5; // 右前 方向
+constexpr uint8_t PIN_BL_PWM = 6; // 左後 PWM
+constexpr uint8_t PIN_BL_DIR = 7; // 左後 方向
+constexpr uint8_t PIN_BR_PWM = 8; // 右後 PWM
+constexpr uint8_t PIN_BR_DIR = 9; // 右後 方向
+
+// --- 兩顆無刷 ESC ---
+constexpr uint8_t PIN_ESC_L_THR = 10; // 左 ESC 白線（油門）
+constexpr uint8_t PIN_ESC_L_REV = 11; // 左 ESC 黃線（反推方向）
+constexpr uint8_t PIN_ESC_R_THR = 12; // 右 ESC 白線（油門）
+constexpr uint8_t PIN_ESC_R_REV = 13; // 右 ESC 黃線（反推方向）
+
+// --- 伺服馬達（俯仰）---
+constexpr uint8_t PIN_SERVO_PITCH = 14;
+
+// --- 外部串列埠（保留接口）---
+constexpr uint8_t PIN_UART_TX = 0; // Pico TX → 外部 RX
+constexpr uint8_t PIN_UART_RX = 1; // Pico RX ← 外部 TX
+constexpr uint32_t LINK_BAUD = 115200;
+
+// ============================================================
+//  2. 底盤參數
+// ============================================================
+constexpr uint32_t CHASSIS_PWM_FREQ = 20000; // 20 kHz，減少馬達叫聲
+constexpr int PWM_MAX = 255;                 // 滿刻度
+
+// 前進時 DIR 腳要送的準位。若「四輪全部相反」就把兩者對調。
+constexpr uint8_t DIR_FORWARD = HIGH;
+constexpr uint8_t DIR_BACKWARD = LOW;
+
+// 麥克納姆混控修正：方向不對時改這裡（不用重接線）
+//   平移左右相反 -> STRAFE_SIGN = -1
+//   旋轉左右相反 -> ROTATE_SIGN = -1
+constexpr int STRAFE_SIGN = +1; // +1 = d 往右, a 往左
+constexpr int ROTATE_SIGN = +1; // +1 = q 逆時針, e 順時針（由上往下看）
+
+// 單輪個別反向（只有某一輪方向錯才需要改）
+constexpr bool FL_REVERSED = false;
+constexpr bool FR_REVERSED = false;
+constexpr bool BL_REVERSED = false;
+constexpr bool BR_REVERSED = false;
+
+// 底盤加減速斜率：每 6ms 最多改變 12 階（0~255）
+constexpr int CHASSIS_RAMP_STEP = 12;
+constexpr uint32_t CHASSIS_RAMP_INTERVAL_MS = 6;
+
+// ============================================================
+//  3. 無刷 ESC 參數
+// ============================================================
+constexpr int THR_STOP_US = 1000; // 油門：停止
+constexpr int THR_FULL_US = 2000; // 油門：全速
+constexpr int REV_FORWARD_US = 1000; // 方向線：正轉
+constexpr int REV_BACKWARD_US = 2000; // 方向線：反轉
+constexpr int MIN_MAG = 12;           // 無刷啟動死區，太低只發熱不轉
+constexpr int ESC_RAMP_STEP = 8;      // 油門斜率，每 6ms 8 階
+constexpr uint32_t ESC_RAMP_INTERVAL_MS = 6;
+
+// 反轉保護：先歸零 → 等馬達停 → 切方向 → 空窗 → 才給油門
+constexpr uint32_t ESC_DIR_STOP_MS = 250;
+constexpr uint32_t ESC_DIR_SETTLE_MS = 400;
+
+// 開機時先穩定送「停止」訊號 1 秒，讓 ESC 能正常 arm
+constexpr uint32_t BOOT_ARM_DELAY_MS = 1000;
+
+// ============================================================
+//  4. 伺服參數
+// ============================================================
+constexpr int SERVO_MIN_DEG = 0;
+constexpr int SERVO_MAX_DEG = 180;
+constexpr int SERVO_CENTER_DEG = 90;
+constexpr int SERVO_STEP_DEG = 5;
+
+// 標準伺服 1000~2000us；若你的伺服是 500~2500us 就改這兩行
+constexpr int SERVO_MIN_US = 1000;
+constexpr int SERVO_MAX_US = 2000;
+
+// 若 p 的方向和機構相反，改成 true
+constexpr bool SERVO_INVERT = false;
+
+// ============================================================
+//  5. 安全參數
+// ============================================================
+// 超過這個時間沒收到任何指令就自動停止（底盤 + 無刷）。
+// 0 = 關閉。當「放開即停」的死人開關可設 1000。可用 Y 指令即時設定。
+uint32_t linkTimeoutMs = 0;
+
+// ============================================================
+//  6. 輸出目標（指令回覆要回到發話的那一邊）
+// ============================================================
+enum class Src { USB, UART };
+Stream* out = &Serial; // 目前的輸出串列埠
+
+Stream* streamFor(Src s) {
+    return (s == Src::USB) ? (Stream*)&Serial : (Stream*)&Serial1;
+}
+
+// ---------- 週期計時 ----------
+uint32_t lastCommandMs = 0;
+uint32_t lastChassisRampMs = 0;
+uint32_t lastEscRampMs = 0;
+uint32_t telemetryMs = 0;
+uint32_t lastTelemetryMs = 0;
+Src telemetrySrc = Src::UART;
+
+// ============================================================
+//  7. 底盤：馬達物件
+// ============================================================
+struct ChassisMotor {
+    uint8_t pwmPin;
+    uint8_t dirPin;
+    bool reversed;
+    int current = 0; // 目前輸出 -255 ~ 255
+};
+
+ChassisMotor wheelFL{PIN_FL_PWM, PIN_FL_DIR, FL_REVERSED};
+ChassisMotor wheelFR{PIN_FR_PWM, PIN_FR_DIR, FR_REVERSED};
+ChassisMotor wheelBL{PIN_BL_PWM, PIN_BL_DIR, BL_REVERSED};
+ChassisMotor wheelBR{PIN_BR_PWM, PIN_BR_DIR, BR_REVERSED};
+ChassisMotor* const wheels[] = {&wheelFL, &wheelFR, &wheelBL, &wheelBR};
+
+// 底盤運動目標（-1.0 ~ 1.0）
+float setVx = 0.0f; // 右為正
+float setVy = 0.0f; // 前為正
+float setWz = 0.0f; // 逆時針為正
+int chassisSpeed = 150; // 0 ~ 255 主速度
+
+// ============================================================
+//  8. 底盤：輸出
+// ============================================================
+void chassisWrite(ChassisMotor& m, int value) {
+    value = constrain(value, -PWM_MAX, PWM_MAX);
+    bool forward = (value >= 0);
+    if(m.reversed)
+        forward = !forward;
+    digitalWrite(m.dirPin, forward ? DIR_FORWARD : DIR_BACKWARD);
+    analogWrite(m.pwmPin, abs(value));
+}
+
+int chassisRamp(int current, int target); // 前向宣告
+
+void chassisAll(int value) {
+    for(ChassisMotor* m : wheels) {
+        m->current = value;
+        chassisWrite(*m, value);
+    }
+}
+
+void chassisStop() {
+    setVx = setVy = setWz = 0.0f;
+    chassisAll(0);
+}
+
+// 麥克納姆輪混控 + 正規化，再乘上主速度
+void chassisApplyTargets() {
+    float vx = setVx * STRAFE_SIGN;
+    float vy = setVy;
+    float wz = setWz * ROTATE_SIGN;
+
+    float fl = vy - vx - wz;
+    float fr = vy + vx + wz;
+    float bl = vy + vx - wz;
+    float br = vy - vx + wz;
+
+    // 正規化：確保四輪比例不變且不超過滿刻度
+    float m = 1.0f;
+    m = max(m, fabsf(fl));
+    m = max(m, fabsf(fr));
+    m = max(m, fabsf(bl));
+    m = max(m, fabsf(br));
+    if(m > 1.0f) {
+        fl /= m;
+        fr /= m;
+        bl /= m;
+        br /= m;
+    }
+
+    float s = (float)chassisSpeed;
+    wheelFL.current = chassisRamp(wheelFL.current, (int)lroundf(fl * s));
+    wheelFR.current = chassisRamp(wheelFR.current, (int)lroundf(fr * s));
+    wheelBL.current = chassisRamp(wheelBL.current, (int)lroundf(bl * s));
+    wheelBR.current = chassisRamp(wheelBR.current, (int)lroundf(br * s));
+}
+
+int chassisRamp(int current, int target) {
+    if(current < target)
+        return min(current + CHASSIS_RAMP_STEP, target);
+    if(current > target)
+        return max(current - CHASSIS_RAMP_STEP, target);
+    return current;
+}
+
+void chassisService() {
+    chassisApplyTargets();
+    for(ChassisMotor* m : wheels)
+        chassisWrite(*m, m->current);
+}
+
+// ============================================================
+//  9. 無刷 ESC
+// ============================================================
+struct Esc {
+    uint8_t thrPin;
+    uint8_t revPin;
+    Servo thr;
+    Servo rev;
+
+    int dir = 1; // 目前方向 +1 / -1
+    int mag = 0; // 目前油門 0~255
+    uint32_t t = 0;
+    uint32_t settleUntil = 0;
+
+    void begin() {
+        // 用 4 參數版 attach，直接從「停止 / 正轉」開始，
+        // 避免 attach 瞬間先送 1500us 的中間值吵到 ESC。
+        thr.attach(thrPin, THR_STOP_US, THR_FULL_US, THR_STOP_US);
+        rev.attach(revPin, 1000, 2000, REV_FORWARD_US);
+        dir = 1;
+        mag = 0;
+        settleUntil = 0;
+        rev.writeMicroseconds(REV_FORWARD_US);
+        thr.writeMicroseconds(THR_STOP_US);
+    }
+
+    void setThrottle(int v) {
+        v = constrain(v, 0, PWM_MAX);
+        if(v < MIN_MAG)
+            v = 0;
+        thr.writeMicroseconds(THR_STOP_US + v * (THR_FULL_US - THR_STOP_US) / PWM_MAX);
+    }
+
+    void setDir(int d) {
+        rev.writeMicroseconds((d < 0) ? REV_BACKWARD_US : REV_FORWARD_US);
+    }
+
+    // 立刻斷油（緊急停止用；方向線保持不動）
+    void kill() {
+        mag = 0;
+        setThrottle(0);
+    }
+
+    // 狀態機：換向保護 + 油門斜率
+    void update(int wantMag, int wantDir, uint32_t now) {
+        if(wantDir != dir) {
+            if(mag > 0) {
+                mag = 0;
+                setThrottle(0);
+                t = now;
+                return;
+            }
+            if(now - t >= ESC_DIR_STOP_MS) {
+                dir = wantDir;
+                setDir(dir);
+                settleUntil = now + ESC_DIR_SETTLE_MS;
+                t = now;
+            }
+            return;
+        }
+        if(now < settleUntil)
+            return;
+
+        int target = constrain(wantMag, 0, PWM_MAX);
+        if(target < MIN_MAG)
+            target = 0;
+
+        int old = mag;
+        if(mag < target)
+            mag = min(mag + ESC_RAMP_STEP, target);
+        else if(mag > target)
+            mag = max(mag - ESC_RAMP_STEP, target);
+
+        if(mag != old)
+            setThrottle(mag);
+    }
+};
+
+Esc escL{PIN_ESC_L_THR, PIN_ESC_L_REV};
+Esc escR{PIN_ESC_R_THR, PIN_ESC_R_REV};
+Esc* const escs[] = {&escL, &escR};
+
+// 無刷狀態
+bool brushlessOn = false;
+int brushlessSpeed = 150; // 0 ~ 255
+int brushlessDir = 1;     // +1 正轉, -1 反轉
+
+void brushlessStop() {
+    brushlessOn = false;
+    for(Esc* e : escs)
+        e->kill();
+}
+
+void brushlessService(uint32_t now) {
+    int wantMag = brushlessOn ? brushlessSpeed : 0;
+    for(Esc* e : escs)
+        e->update(wantMag, brushlessDir, now);
+}
+
+// ============================================================
+// 10. 伺服馬達
+// ============================================================
+Servo pitchServo;
+int servoAngle = SERVO_CENTER_DEG;
+
+void applyServo() {
+    int deg = constrain(servoAngle, SERVO_MIN_DEG, SERVO_MAX_DEG);
+    pitchServo.write(SERVO_INVERT ? (SERVO_MAX_DEG + SERVO_MIN_DEG - deg) : deg);
+}
+
+void setServoAngle(int deg) {
+    servoAngle = constrain(deg, SERVO_MIN_DEG, SERVO_MAX_DEG);
+    applyServo();
+}
+
+// ============================================================
+// 11. 狀態字串 / 輸出
+// ============================================================
+const char* chassisDirName() {
+    if(setVx == 0.0f && setVy == 0.0f && setWz == 0.0f)
+        return "停止";
+    return "移動";
+}
+
+void printStatus() {
+    out->print("[狀態] 底盤 ");
+    out->print(chassisDirName());
+    out->print(" vx=");
+    out->print(setVx, 2);
+    out->print(" vy=");
+    out->print(setVy, 2);
+    out->print(" wz=");
+    out->print(setWz, 2);
+    out->print(" 速度=");
+    out->print(chassisSpeed);
+    out->print(" (");
+    out->print(chassisSpeed * 100 / PWM_MAX);
+    out->print("%)");
+
+    out->print(" | 輪 FL=");
+    out->print(wheelFL.current);
+    out->print(" FR=");
+    out->print(wheelFR.current);
+    out->print(" BL=");
+    out->print(wheelBL.current);
+    out->print(" BR=");
+    out->print(wheelBR.current);
+
+    out->print(" | 無刷=");
+    if(brushlessOn) {
+        out->print(brushlessDir < 0 ? "-" : "+");
+        out->print(brushlessSpeed);
+        out->print(" (");
+        out->print(brushlessSpeed * 100 / PWM_MAX);
+        out->print("%)");
+    } else {
+        out->print("停止");
+    }
+
+    out->print(" | 俯仰=");
+    out->print(servoAngle);
+    out->println("°");
+}
+
+// 給外部 MCU 用的 CSV 遙測
+void printTelemetry() {
+    out->print("T,");
+    out->print(millis());
+    out->print(",");
+    out->print(setVx, 2);
+    out->print(",");
+    out->print(setVy, 2);
+    out->print(",");
+    out->print(setWz, 2);
+    out->print(",");
+    out->print(wheelFL.current);
+    out->print(",");
+    out->print(wheelFR.current);
+    out->print(",");
+    out->print(wheelBL.current);
+    out->print(",");
+    out->print(wheelBR.current);
+    out->print(",");
+    out->print(brushlessOn ? brushlessSpeed * brushlessDir : 0);
+    out->print(",");
+    out->print(escL.dir * escL.mag);
+    out->print(",");
+    out->print(escR.dir * escR.mag);
+    out->print(",");
+    out->println(servoAngle);
+}
+
+void printManualHelp() {
+    out->println();
+    out->println("===== 整合控制 (USB Serial Monitor 115200) =====");
+    out->println("  【底盤 全向移動】");
+    out->println("   w 前   s 後   a 左移   d 右移");
+    out->println("   u 左前 i 右前 j 左後 k 右後 (斜向)");
+    out->println("   q 逆時針轉   e 順時針轉   n 停止旋轉");
+    out->println("   x 或 空白 : 底盤停止");
+    out->println("   1~9 設定速度(1慢~9快)   0 速度歸零");
+    out->println("   + / - : 速度 +10% / -10%");
+    out->println("  【無刷馬達】");
+    out->println("   b : 啟動 / 停止         v : 切換正反轉");
+    out->println("   , / . : 轉速 -5% / +5%");
+    out->println("  【伺服 俯仰角】");
+    out->println("   p : 角度 +5°            o : 角度 -5°");
+    out->println("  【其他】");
+    out->println("   t : 底盤逐輪測試        c : 無刷逐顆測試");
+    out->println("   k : ESC 油門行程校正    ! : 緊急停止(全部)");
+    out->println("   z : 顯示狀態            h / ? : 本說明");
+    out->println("  【外部 UART 指令】");
+    out->println("   行首加冒號即可測試，例如： :M 0.5 0 0");
+    out->println("   完整指令表按 H 或看 README.md");
+    out->println("===============================================");
+}
+
+void printProtocolHelp() {
+    out->println();
+    out->println("===== 外部 UART 文字協定 (115200 8N1) =====");
+    out->println(" 每行一個指令，換行結尾，不分大小寫。");
+    out->println("  M <vx> <vy> <wz>  底盤運動，各 -1.0~1.0");
+    out->println("                    vx=右, vy=前, wz=逆時針");
+    out->println("                    (可只給 2 個值，wz 預設 0)");
+    out->println("  G                 底盤停止（歸零 setpoint）");
+    out->println("  T <0~1>           底盤主速度比例");
+    out->println("  B <-1.0~1.0>      無刷油門，正負代表方向");
+    out->println("  S <0~180>         伺服俯仰角（度）");
+    out->println("  Y <ms>            通訊逾時自動停止，0=關閉");
+    out->println("  W <ms>            週期遙測(ms)，0=關閉");
+    out->println("  P                 回報狀態");
+    out->println("  E                 緊急停止（底盤+無刷，立即）");
+    out->println("  R                 全部停止並歸零");
+    out->println("  H 或 ?            本說明");
+    out->println("=========================================");
+}
+
+// ============================================================
+// 12. 外部介面：套用
+// ============================================================
+float clampUnit(float v) {
+    return constrain(v, -1.0f, 1.0f);
+}
+
+void setMotion(float vx, float vy, float wz) {
+    setVx = clampUnit(vx);
+    setVy = clampUnit(vy);
+    setWz = clampUnit(wz);
+}
+
+void setBrushless(float thr) {
+    thr = constrain(thr, -1.0f, 1.0f);
+    if(thr == 0.0f) {
+        brushlessOn = false;
+        return;
+    }
+    brushlessDir = (thr < 0.0f) ? -1 : 1;
+    brushlessSpeed = (int)lroundf(fabsf(thr) * PWM_MAX);
+    brushlessOn = true;
+}
+
+void setChassisSpeedRatio(float r) {
+    r = constrain(r, 0.0f, 1.0f);
+    chassisSpeed = (int)lroundf(r * PWM_MAX);
+}
+
+void emergencyStop() {
+    chassisStop();
+    brushlessStop();
+}
+
+// ============================================================
+// 13. 校正 / 測試（會阻塞，請把車子架空）
+// ============================================================
+// 等任一串列埠收到 Enter，回傳是否在時限內收到
+bool waitForAnyEnter(uint32_t timeoutMs) {
+    uint32_t t0 = millis();
+    while(millis() - t0 < timeoutMs) {
+        if(Serial.available()) {
+            while(Serial.available())
+                Serial.read();
+            return true;
+        }
+        if(Serial1.available()) {
+            while(Serial1.available())
+                Serial1.read();
+            return true;
+        }
+        delay(10);
+    }
+    return false;
+}
+
+// ESC 油門行程校正
+void calibrateThrottle() {
+    out->println();
+    out->println("========== 無刷油門行程校正 ==========");
+    out->println(" 1. 先確認 ESC 的電池『還沒接上』");
+    out->println(" 2. 程式現在持續送出『最大油門 2000us』");
+    out->println(" 3. 接上 ESC 電池，會聽到『嗶-嗶-』兩聲");
+    out->println(" 4. 聽到後『立刻按 Enter』");
+    out->println(" 5. 程式送出『最低油門 1000us』，");
+    out->println("    聽到『嗶 N 聲 + 一長聲』就完成");
+    out->println("====================================");
+
+    brushlessStop();
+    for(Esc* e : escs)
+        e->thr.writeMicroseconds(THR_FULL_US);
+    out->println(">>> 目前輸出 2000us，接電池並在兩聲短嗶後按 Enter...");
+
+    if(!waitForAnyEnter(15000))
+        out->println(">>> 逾時(15 秒)，直接下一步。可再按 k 重來。");
+
+    for(Esc* e : escs)
+        e->thr.writeMicroseconds(THR_STOP_US);
+    out->println(">>> 目前已輸出 1000us，請聽『嗶 N 聲 + 長嗶』...");
+    delay(2500);
+
+    for(Esc* e : escs) {
+        e->mag = 0;
+        e->dir = 1;
+        e->settleUntil = 0;
+        e->setDir(1);
+        e->setThrottle(0);
+    }
+    out->println(">>> 校正結束，馬達應該停住。");
+    printStatus();
+}
+
+// 無刷逐顆測試：正轉 → 停 → 反轉
+void testBrushless() {
+    out->println();
+    out->println("[測試] 無刷逐顆 正轉1.5s -> 停 -> 反轉1.5s");
+    out->println("       重點：兩顆的『正轉』要是同一個物理方向。");
+    const char* names[] = {"左 (THR GP10 / REV GP11)", "右 (THR GP12 / REV GP13)"};
+
+    brushlessStop();
+    for(int i = 0; i < 2; i++) {
+        Esc& e = *escs[i];
+        for(int pass = 0; pass < 2; pass++) {
+            int d = (pass == 0) ? 1 : -1;
+            out->print(pass == 0 ? "  正轉 -> " : "  反轉 -> ");
+            out->println(names[i]);
+
+            uint32_t w = millis();
+            while(millis() - w < 1200) {
+                e.update(0, d, millis());
+                delay(5);
+            }
+            w = millis();
+            while(millis() - w < 1500) {
+                e.update(120, d, millis());
+                delay(5);
+            }
+            w = millis();
+            while(millis() - w < 600) {
+                e.update(0, d, millis());
+                delay(5);
+            }
+        }
+    }
+    for(Esc* e : escs) {
+        e->kill();
+        e->dir = 1;
+        e->setDir(1);
+    }
+    out->println("[測試] 結束，馬達已停止");
+    printStatus();
+}
+
+// 底盤逐輪測試：確認四輪物理方向一致（請架空）
+void testChassis() {
+    chassisStop();
+    out->println();
+    out->println("[測試] 底盤逐輪慢速前進 1.5 秒，請確認四輪滾動方向都一樣。");
+    out->println("       某一輪相反就把該輪的 *_REVERSED 改成 true。");
+    const char* names[] = {"FL 左前", "FR 右前", "BL 左後", "BR 右後"};
+    for(int i = 0; i < 4; i++) {
+        out->print("  測試 -> ");
+        out->println(names[i]);
+        chassisWrite(*wheels[i], 120);
+        delay(1500);
+        chassisWrite(*wheels[i], 0);
+        delay(300);
+    }
+    chassisStop();
+    out->println("[測試] 結束，底盤已停止");
+    printStatus();
+}
+
+// ============================================================
+// 14. 文字協定解析（USB 加冒號 / UART 直接送）
+// ============================================================
+void handleProtocolLine(char* line, Src src) {
+    out = streamFor(src);
+
+    char* save = nullptr;
+    char* cmd = strtok_r(line, " \t,", &save);
+    if(cmd == nullptr || cmd[0] == '\0')
+        return;
+    for(char* p = cmd; *p; ++p)
+        *p = (char)toupper((unsigned char)*p);
+
+    if(!strcmp(cmd, "M")) {
+        char* a = strtok_r(nullptr, " \t,", &save);
+        char* b = strtok_r(nullptr, " \t,", &save);
+        char* c = strtok_r(nullptr, " \t,", &save);
+        float vx = a ? atof(a) : 0.0f;
+        float vy = b ? atof(b) : 0.0f;
+        float wz = c ? atof(c) : 0.0f;
+        setMotion(vx, vy, wz);
+        out->println("OK M");
+        printStatus();
+    } else if(!strcmp(cmd, "G")) {
+        chassisStop();
+        out->println("OK G");
+    } else if(!strcmp(cmd, "T")) {
+        char* a = strtok_r(nullptr, " \t,", &save);
+        setChassisSpeedRatio(a ? atof(a) : 0.0f);
+        out->println("OK T");
+    } else if(!strcmp(cmd, "B")) {
+        char* a = strtok_r(nullptr, " \t,", &save);
+        setBrushless(a ? atof(a) : 0.0f);
+        out->println("OK B");
+    } else if(!strcmp(cmd, "S")) {
+        char* a = strtok_r(nullptr, " \t,", &save);
+        setServoAngle(a ? atoi(a) : SERVO_CENTER_DEG);
+        out->println("OK S");
+    } else if(!strcmp(cmd, "Y")) {
+        char* a = strtok_r(nullptr, " \t,", &save);
+        linkTimeoutMs = a ? (uint32_t)strtoul(a, nullptr, 10) : 0;
+        out->println("OK Y");
+    } else if(!strcmp(cmd, "W")) {
+        char* a = strtok_r(nullptr, " \t,", &save);
+        telemetryMs = a ? (uint32_t)strtoul(a, nullptr, 10) : 0;
+        telemetrySrc = src;
+        out->println("OK W");
+    } else if(!strcmp(cmd, "P")) {
+        printStatus();
+    } else if(!strcmp(cmd, "E")) {
+        emergencyStop();
+        out->println("OK E (緊急停止)");
+    } else if(!strcmp(cmd, "R")) {
+        emergencyStop();
+        setServoAngle(SERVO_CENTER_DEG);
+        out->println("OK R (全部歸零)");
+    } else if(!strcmp(cmd, "H") || !strcmp(cmd, "?")) {
+        printProtocolHelp();
+    } else {
+        out->print("ERR 未知指令: ");
+        out->println(cmd);
+    }
+    lastCommandMs = millis();
+}
+
+// ============================================================
+// 15. 輸入緩衝與分派
+// ============================================================
+constexpr uint8_t LINE_MAX = 96;
+char usbLine[LINE_MAX];
+uint8_t usbLineLen = 0;
+bool usbProtoActive = false; // USB 是否正在收「冒號模式」的一行
+
+char uartLine[LINE_MAX];
+uint8_t uartLineLen = 0;
+
+// 手動單鍵控制（USB Serial Monitor）
+void handleManualKey(char c) {
+    out = &Serial;
+    switch(c) {
+    // --- 底盤方向 ---
+    case 'w': case 'W': setMotion(0.0f, 1.0f, setWz); printStatus(); break;
+    case 's': case 'S': setMotion(0.0f, -1.0f, setWz); printStatus(); break;
+    case 'a': case 'A': setMotion(-1.0f, 0.0f, setWz); printStatus(); break;
+    case 'd': case 'D': setMotion(1.0f, 0.0f, setWz); printStatus(); break;
+    case 'u': case 'U': setMotion(-0.707f, 0.707f, setWz); printStatus(); break;
+    case 'i': case 'I': setMotion(0.707f, 0.707f, setWz); printStatus(); break;
+    case 'j': case 'J': setMotion(-0.707f, -0.707f, setWz); printStatus(); break;
+    case 'k': case 'K': setMotion(0.707f, -0.707f, setWz); printStatus(); break;
+
+    // --- 底盤旋轉 ---
+    case 'q': case 'Q': setMotion(setVx, setVy, -1.0f); printStatus(); break;
+    case 'e': case 'E': setMotion(setVx, setVy, 1.0f); printStatus(); break;
+    case 'n': case 'N': setMotion(setVx, setVy, 0.0f); printStatus(); break;
+
+    // --- 底盤停止 ---
+    case 'x': case 'X': case ' ': chassisStop(); printStatus(); break;
+
+    // --- 底盤速度 ---
+    case '+': case '=':
+        chassisSpeed = constrain(chassisSpeed + PWM_MAX / 10, 0, PWM_MAX);
+        printStatus();
+        break;
+    case '-': case '_':
+        chassisSpeed = constrain(chassisSpeed - PWM_MAX / 10, 0, PWM_MAX);
+        printStatus();
+        break;
+
+    // --- 無刷 ---
+    case 'b': case 'B':
+        brushlessOn = !brushlessOn;
+        if(!brushlessOn)
+            brushlessStop();
+        printStatus();
+        break;
+    case 'v': case 'V':
+        brushlessDir = -brushlessDir;
+        printStatus();
+        break;
+    case ',': case '<':
+        brushlessSpeed = constrain(brushlessSpeed - PWM_MAX / 20, 0, PWM_MAX);
+        printStatus();
+        break;
+    case '.': case '>':
+        brushlessSpeed = constrain(brushlessSpeed + PWM_MAX / 20, 0, PWM_MAX);
+        printStatus();
+        break;
+
+    // --- 伺服 ---
+    case 'p': case 'P': setServoAngle(servoAngle + SERVO_STEP_DEG); printStatus(); break;
+    case 'o': case 'O': setServoAngle(servoAngle - SERVO_STEP_DEG); printStatus(); break;
+
+    // --- 測試 / 校正 ---
+    case 't': case 'T': testChassis(); break;
+    case 'c': case 'C': testBrushless(); break;
+    case 'f': case 'F': calibrateThrottle(); break;
+
+    // --- 緊急停止 ---
+    case '!':
+        emergencyStop();
+        out->println("[安全] 緊急停止！底盤 + 無刷已斷油");
+        printStatus();
+        break;
+
+    // --- 狀態 / 說明 ---
+    case 'z': case 'Z': printStatus(); break;
+    case 'h': case 'H': case '?': printManualHelp(); break;
+
+    default:
+        if(c >= '0' && c <= '9') {
+            if(c == '0')
+                chassisSpeed = 0;
+            else
+                chassisSpeed = (c - '0') * PWM_MAX / 9;
+            out->print("[速度] ");
+            out->print(chassisSpeed);
+            out->print(" (");
+            out->print(chassisSpeed * 100 / PWM_MAX);
+            out->println("%)");
+        }
+        break;
+    }
+    lastCommandMs = millis();
+}
+
+// 註：ESC 油門校正鍵由原本的 k 改成 f，因為 k 已用於「右後」斜向移動。
+void handleUsbChar(char c) {
+    if(usbProtoActive) {
+        if(c == '\n' || c == '\r') {
+            if(usbLineLen > 0) {
+                usbLine[usbLineLen] = '\0';
+                handleProtocolLine(usbLine, Src::USB);
+            }
+            usbLineLen = 0;
+            usbProtoActive = false;
+        } else if(usbLineLen < LINE_MAX - 1) {
+            usbLine[usbLineLen++] = c;
+        }
+        return;
+    }
+
+    if(c == ':') {
+        usbProtoActive = true;
+        usbLineLen = 0;
+        return;
+    }
+    if(c == '\n' || c == '\r')
+        return;
+    handleManualKey(c);
+}
+
+void handleUartChar(char c) {
+    if(c == '\n' || c == '\r') {
+        if(uartLineLen > 0) {
+            uartLine[uartLineLen] = '\0';
+            handleProtocolLine(uartLine, Src::UART);
+        }
+        uartLineLen = 0;
+        return;
+    }
+    if(uartLineLen < LINE_MAX - 1)
+        uartLine[uartLineLen++] = c;
+}
+
+// ============================================================
+// 17. Arduino
+// ============================================================
+void setup() {
+    // 先把 4 條 ESC 訊號線接上並輸出「停止 + 正轉」，
+    // 這樣即使 ESC 和 Pico 同時上電也能正常 arm。
+    for(Esc* e : escs)
+        e->begin();
+
+    // 伺服先回中央
+    pitchServo.attach(PIN_SERVO_PITCH, SERVO_MIN_US, SERVO_MAX_US);
+    applyServo();
+
+    // 底盤腳位
+    for(ChassisMotor* m : wheels) {
+        pinMode(m->pwmPin, OUTPUT);
+        pinMode(m->dirPin, OUTPUT);
+    }
+    analogWriteFreq(CHASSIS_PWM_FREQ);
+    analogWriteRange(PWM_MAX);
+    chassisStop();
+
+    // 外部 UART（保留接口）
+    Serial1.setTX(PIN_UART_TX);
+    Serial1.setRX(PIN_UART_RX);
+    Serial1.begin(LINK_BAUD);
+
+    // 讓 ESC 看到穩定的低油門再 arm
+    delay(BOOT_ARM_DELAY_MS);
+
+    Serial.begin(115200);
+    delay(300);
+
+    out = &Serial;
+    printManualHelp();
+    Serial.println("提示：第一次使用請先做 ESC 油門行程校正 (按 f)。");
+    printStatus();
+
+    lastCommandMs = millis();
+    lastChassisRampMs = millis();
+    lastEscRampMs = millis();
+    lastTelemetryMs = millis();
+}
+
+void loop() {
+    uint32_t now = millis();
+
+    // --- 1. 收指令 ---
+    while(Serial.available() > 0)
+        handleUsbChar((char)Serial.read());
+
+    while(Serial1.available() > 0)
+        handleUartChar((char)Serial1.read());
+
+    // --- 2. 底盤斜率 ---
+    if(now - lastChassisRampMs >= CHASSIS_RAMP_INTERVAL_MS) {
+        lastChassisRampMs = now;
+        chassisService();
+    }
+
+    // --- 3. 無刷斜率 / 換向 ---
+    if(now - lastEscRampMs >= ESC_RAMP_INTERVAL_MS) {
+        lastEscRampMs = now;
+        brushlessService(now);
+    }
+
+    // --- 4. 週期遙測 ---
+    if(telemetryMs > 0 && now - lastTelemetryMs >= telemetryMs) {
+        lastTelemetryMs = now;
+        out = streamFor(telemetrySrc);
+        printTelemetry();
+    }
+
+    // --- 5. 通訊逾時保護 ---
+    if(linkTimeoutMs > 0 && now - lastCommandMs > linkTimeoutMs) {
+        bool busy = brushlessOn || setVx != 0.0f || setVy != 0.0f || setWz != 0.0f;
+        if(busy) {
+            emergencyStop();
+            out = &Serial;
+            out->println("[安全] 太久沒收到指令，自動停止");
+            printStatus();
+        }
+        lastCommandMs = now; // 避免重複觸發
+    }
+}

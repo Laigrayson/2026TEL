@@ -1,0 +1,247 @@
+/* ============================================================
+ *  麥克納姆輪小車 - Serial Monitor 測試程式
+ *  板子 : Raspberry Pi Pico
+ *  核心 : arduino-pico (earlephilhower)
+ *  ------------------------------------------------------------
+ *  第一階段只實作：直走 / 後退 / 停止  + 速度調整
+ *
+ *  操作（Serial Monitor 115200, 輸入字元後按 Enter 或直接送）：
+ *    w 或 f  : 直走
+ *    s 或 b  : 後退
+ *    x 或空白 : 停止
+ *    1 ~ 9   : 設定速度 (1 = 最慢, 9 = 最快)
+ *    + / -   : 速度 +10% / -10%
+ *    c       : 逐輪校正 (依序讓每顆馬達慢速前進)
+ *    h 或 ?  : 顯示說明
+ * ============================================================ */
+
+#include <Arduino.h>
+
+// ---------- 接線：PWM = 速度, DIR = 方向 ----------
+constexpr uint8_t MOTOR_FR_PWM = 6;  // p2
+constexpr uint8_t MOTOR_FR_DIR = 7;  // d2
+constexpr uint8_t MOTOR_FL_PWM = 8;  // p1
+constexpr uint8_t MOTOR_FL_DIR = 9;  // d1
+constexpr uint8_t MOTOR_BR_PWM = 10; // p4
+constexpr uint8_t MOTOR_BR_DIR = 11; // d4
+constexpr uint8_t MOTOR_BL_PWM = 12; // p3
+constexpr uint8_t MOTOR_BL_DIR = 13; // d3
+
+// ---------- 參數 ----------
+constexpr uint32_t PWM_FREQ = 20000; // 20 kHz，減少馬達高頻叫聲
+constexpr int PWM_MAX = 255;
+
+// 直走時 DIR 腳位要送的電位。若「四顆輪子全部相反」就把這兩個對調。
+constexpr uint8_t DIR_FORWARD = HIGH;
+constexpr uint8_t DIR_BACKWARD = LOW;
+
+// 底盤左右馬達是鏡像安裝，所以其中一側的 DIR 極性必須反過來，
+// 四輪才會往同一個物理方向前進。
+// 若按 w 變成「逆時針原地轉」，把這裡改成 false（等於換反另一側）。
+constexpr bool MIRROR_RIGHT_SIDE = true;
+
+// 安全機制：超過這個時間沒收到指令就自動停止。
+// 0 = 關閉。想當「放開即停」的死人開關可設 1000 (ms)。
+constexpr uint32_t COMMAND_TIMEOUT_MS = 0;
+
+// ---------- 馬達物件 ----------
+struct Motor {
+    uint8_t pwmPin;
+    uint8_t dirPin;
+    bool reversed; // 若「只有這一輪」轉向相反，改成 true 校正
+};
+
+Motor motorFR{MOTOR_FR_PWM, MOTOR_FR_DIR, MIRROR_RIGHT_SIDE};   // 右前
+Motor motorFL{MOTOR_FL_PWM, MOTOR_FL_DIR, false};               // 左前
+Motor motorBR{MOTOR_BR_PWM, MOTOR_BR_DIR, MIRROR_RIGHT_SIDE};   // 右後
+Motor motorBL{MOTOR_BL_PWM, MOTOR_BL_DIR, false};               // 左後
+
+Motor* const motors[] = {&motorFR, &motorFL, &motorBR, &motorBL};
+
+// ---------- 狀態 ----------
+enum class Drive { Stop, Forward, Backward };
+Drive driveState = Drive::Stop;
+int speedSetting = 150; // 0 ~ 255
+uint32_t lastCommandMs = 0;
+
+// ---------- 基本輸出 ----------
+void motorWrite(const Motor& m, int speed) {
+    speed = constrain(speed, -PWM_MAX, PWM_MAX);
+    bool forward = (speed >= 0);
+    if(m.reversed)
+        forward = !forward;
+    digitalWrite(m.dirPin, forward ? DIR_FORWARD : DIR_BACKWARD);
+    analogWrite(m.pwmPin, abs(speed));
+}
+
+// 麥克納姆輪：直走 / 後退 時四輪同向同速
+void driveAll(int speed) {
+    for(Motor* m : motors) {
+        motorWrite(*m, speed);
+    }
+}
+
+void stopAll() {
+    driveAll(0);
+    driveState = Drive::Stop;
+    lastCommandMs = millis();
+}
+
+void applyDrive() {
+    int s = (driveState == Drive::Stop) ? 0 : speedSetting;
+    if(driveState == Drive::Backward)
+        s = -s;
+    driveAll(s);
+    lastCommandMs = millis();
+}
+
+const char* driveName() {
+    switch(driveState) {
+    case Drive::Forward:
+        return "直走 (FORWARD)";
+    case Drive::Backward:
+        return "後退 (BACKWARD)";
+    default:
+        return "停止 (STOP)";
+    }
+}
+
+void printStatus() {
+    Serial.print("[狀態] ");
+    Serial.print(driveName());
+    Serial.print("  速度=");
+    Serial.print(speedSetting);
+    Serial.print(" (");
+    Serial.print(speedSetting * 100 / PWM_MAX);
+    Serial.println("%)");
+}
+
+void printHelp() {
+    Serial.println();
+    Serial.println("===== 麥克納姆輪測試 (直走 / 後退) =====");
+    Serial.println("  w 或 f   : 直走");
+    Serial.println("  s 或 b   : 後退");
+    Serial.println("  x 或空白 : 停止");
+    Serial.println("  1 ~ 9    : 設定速度 (1 最慢 ~ 9 最快)");
+    Serial.println("  + / -    : 速度 +10% / -10%");
+    Serial.println("  c        : 逐輪校正 (依序讓每顆馬達慢速前進)");
+    Serial.println("  h 或 ?   : 顯示說明");
+    Serial.println("========================================");
+}
+
+// 逐輪慢速前進，用來確認四輪物理方向是否一致。
+// 請先把車子架空，再觀察每一輪的滾動方向是否相同。
+void calibrate() {
+    Serial.println();
+    Serial.println("[校正] 依序單輪慢速前進 1.5 秒，請確認四輪滾動方向是否都一樣。");
+    Serial.println("       若某一輪相反，就把該馬達的 reversed 改成相反值後重新燒錄。");
+    const char* names[] = {"FR 右前", "FL 左前", "BR 右後", "BL 左後"};
+    for(int i = 0; i < 4; i++) {
+        Serial.print("  測試 -> ");
+        Serial.println(names[i]);
+        motorWrite(*motors[i], 120);
+        delay(1500);
+        motorWrite(*motors[i], 0);
+        delay(300);
+    }
+    Serial.println("[校正] 結束，馬達已停止");
+    printStatus();
+}
+
+void setSpeed(int value) {
+    speedSetting = constrain(value, 0, PWM_MAX);
+    if(driveState != Drive::Stop)
+        applyDrive();
+    printStatus();
+}
+
+// ---------- 指令處理 ----------
+void handleCommand(char c) {
+    switch(c) {
+    case 'w':
+    case 'W':
+    case 'f':
+    case 'F':
+        driveState = Drive::Forward;
+        applyDrive();
+        printStatus();
+        break;
+
+    case 's':
+    case 'S':
+    case 'b':
+    case 'B':
+        driveState = Drive::Backward;
+        applyDrive();
+        printStatus();
+        break;
+
+    case 'x':
+    case 'X':
+    case ' ':
+        stopAll();
+        printStatus();
+        break;
+
+    case 'c':
+    case 'C':
+        stopAll();
+        calibrate();
+        break;
+
+    case 'h':
+    case 'H':
+    case '?':
+        printHelp();
+        break;
+
+    case '+':
+    case '=':
+        setSpeed(speedSetting + PWM_MAX / 10);
+        break;
+
+    case '-':
+    case '_':
+        setSpeed(speedSetting - PWM_MAX / 10);
+        break;
+
+    default:
+        if(c >= '0' && c <= '9') {
+            int v = (c - '0') * PWM_MAX / 9; // 0 -> 0, 9 -> 255
+            setSpeed(v);
+        }
+        break;
+    }
+}
+
+void setup() {
+    for(Motor* m : motors) {
+        pinMode(m->pwmPin, OUTPUT);
+        pinMode(m->dirPin, OUTPUT);
+    }
+
+    analogWriteFreq(PWM_FREQ);
+    analogWriteRange(PWM_MAX);
+    stopAll(); // 上電先確保停止
+
+    Serial.begin(115200);
+    delay(300); // 等 USB CDC 連上
+    printHelp();
+    printStatus();
+}
+
+void loop() {
+    while(Serial.available() > 0) {
+        char c = (char)Serial.read();
+        if(c == '\n' || c == '\r')
+            continue; // 忽略換行
+        handleCommand(c);
+    }
+
+    if(COMMAND_TIMEOUT_MS > 0 && driveState != Drive::Stop &&
+       millis() - lastCommandMs > COMMAND_TIMEOUT_MS) {
+        stopAll();
+        Serial.println("[安全] 太久沒收到指令，自動停止");
+        printStatus();
+    }
+}

@@ -1,0 +1,312 @@
+/* ============================================================
+ *  Hobbywing SkyWalker 40A V2 ×2  +  伺服馬達（俯仰角度）
+ *  Raspberry Pi Pico / Serial Monitor 控制
+ *  ------------------------------------------------------------
+ *  功能
+ *    無刷 ESC（兩顆，差速機構但只用同向油門）：w / + / - / x
+ *    伺服馬達（俯仰角度）：p / o
+ *
+ *  為什麼每顆無刷 ESC 要接「兩條」訊號線？
+ *    SkyWalker V2 是固定翼用 ESC，本身沒有車用的雙向油門。
+ *    它的正反轉是靠「反推煞車 (Reverse Brake)」功能：
+ *      - 白色線 = 油門 (THR)   ：1000us = 停, 2000us = 全速
+ *      - 黃色線 = 方向 (REV)   ：1000us = 正轉, 2000us = 反轉
+ *    前提：ESC 必須先用編程盒/遙控器把「1. 剎車類型」設成 Reverse。
+ *    （出廠預設是 Disabled，沒設定的話黃線完全沒作用！）
+ *    本程式只用「正轉」，所以開機到關機黃線一律送 1000us。
+ *
+ *  接線
+ *    白 (油門訊號) → GP6 (左) / GP8 (右)
+ *    黃 (反推訊號) → GP7 (左) / GP9 (右)   ← 固定送 1000us
+ *    黑 (GND)      → Pico GND   ← 一定要共地
+ *    紅 (BEC 5V)   → 「不要接」！Pico 用 USB 或獨立 5V 供電
+ *    伺服訊號線    → GP10（橘/黃），伺服電源另外給 5V，GND 與 Pico 共地
+ *
+ *  操作（Serial Monitor 115200，按鍵直接送，不需 Enter）
+ *    w / f     : 前進（無刷油門）
+ *    x / 空白  : 停止
+ *    + / =     : 速度 +5%
+ *    - / _     : 速度 -5%
+ *    p         : 伺服角度 +5°
+ *    o         : 伺服角度 -5°
+ *    h / ?     : 說明
+ * ============================================================ */
+
+#include <Arduino.h>
+#include <Servo.h>
+
+// ============================================================
+//  1. 接線
+// ============================================================
+constexpr uint8_t PIN_THR_L = 6;  // 左 ESC 白線（油門）
+constexpr uint8_t PIN_REV_L = 7;  // 左 ESC 黃線（反推）
+constexpr uint8_t PIN_THR_R = 8;  // 右 ESC 白線（油門）
+constexpr uint8_t PIN_REV_R = 9;  // 右 ESC 黃線（反推）
+constexpr uint8_t PIN_SERVO = 10; // 伺服訊號線（俯仰角度）
+
+// ============================================================
+//  2. ESC 訊號參數
+// ============================================================
+// 油門訊號範圍（校正後 ESC 會記住 1000~2000us）
+constexpr int THR_STOP_US = 1000; // 停止
+constexpr int THR_FULL_US = 2000; // 全速
+
+// 反推方向線：0% = 正轉，100% = 反轉。
+// 注意！ESC 第一次上電時這條線必須在 0%（1000us），所以開機一律送 1000。
+constexpr int REV_FORWARD_US = 1000;
+
+constexpr int PWM_MAX = 255; // 內部運算用的滿刻度
+constexpr int MIN_MAG = 12;  // 低於這個量直接視為 0，避免無刷馬達只發熱不轉
+
+// 加減速斜率
+constexpr int RAMP_STEP = 8;
+constexpr uint32_t RAMP_INTERVAL_MS = 6;
+
+// 安全機制：超過這個時間沒收到指令就自動停止。0 = 關閉。
+constexpr uint32_t COMMAND_TIMEOUT_MS = 0;
+
+// 開機時的主動脈衝時間（ms），讓 Pico 先穩定輸出「停止」訊號再讓使用者上電。
+constexpr uint32_t BOOT_ARM_DELAY_MS = 1000;
+
+// ============================================================
+//  3. 伺服馬達參數（俯仰角度）
+// ============================================================
+constexpr int SERVO_MIN_DEG = 0;   // 機械下極限
+constexpr int SERVO_MAX_DEG = 180; // 機械上極限
+constexpr int SERVO_CENTER_DEG = 90;
+constexpr int SERVO_STEP_DEG = 20; // 每次按 p / o 的角度變化量
+
+// 伺服脈衝範圍：標準伺服 1000us = 0°，2000us = 180°。
+// 若你的伺服是 500~2500us 規格，把下面兩行改成 500 / 2500。
+constexpr int SERVO_MIN_US = 1000;
+constexpr int SERVO_MAX_US = 2000;
+
+// 若 p 的方向和機構相反（p 變成往下），把這裡改成 true。
+constexpr bool SERVO_INVERT = false;
+
+// ============================================================
+//  4. 物件
+// ============================================================
+struct Esc {
+    uint8_t thrPin;
+    uint8_t revPin;
+    Servo thr;
+    Servo rev;
+
+    int wantMag = 0; // 期望油門量 0~255
+    int mag = 0;     // ESC 目前收到的油門量
+};
+
+Esc escL{PIN_THR_L, PIN_REV_L};
+Esc escR{PIN_THR_R, PIN_REV_R};
+Esc* const escs[] = {&escL, &escR};
+
+Servo pitchServo;
+int servoAngle = SERVO_CENTER_DEG;
+
+// ============================================================
+//  5. 狀態
+// ============================================================
+bool running = false;   // true = 前進中
+int speedSetting = 150; // 0 ~ 255
+uint32_t lastCommandMs = 0;
+uint32_t lastRampMs = 0;
+
+// ============================================================
+//  6. 底層輸出
+// ============================================================
+void writeThrottle(Esc& e, int mag) {
+    mag = constrain(mag, 0, PWM_MAX);
+    if(mag < MIN_MAG)
+        mag = 0;
+    e.thr.writeMicroseconds(THR_STOP_US +
+                            mag * (THR_FULL_US - THR_STOP_US) / PWM_MAX);
+}
+
+void stopAllOutputs() {
+    for(Esc* e : escs) {
+        e->mag = 0;
+        e->wantMag = 0;
+        e->rev.writeMicroseconds(REV_FORWARD_US); // 永遠正轉
+        writeThrottle(*e, 0);
+    }
+}
+
+void updateEsc(Esc& e) {
+    int target = running ? e.wantMag : 0;
+    int next = e.mag;
+    if(next < target)
+        next = min(next + RAMP_STEP, target);
+    else if(next > target)
+        next = max(next - RAMP_STEP, target);
+
+    if(next != e.mag) {
+        e.mag = next;
+        writeThrottle(e, e.mag);
+    }
+}
+
+// ============================================================
+//  7. 伺服馬達
+// ============================================================
+void applyServo() {
+    int deg = constrain(servoAngle, SERVO_MIN_DEG, SERVO_MAX_DEG);
+    pitchServo.write(SERVO_INVERT ? (SERVO_MAX_DEG + SERVO_MIN_DEG - deg)
+                                  : deg);
+}
+
+void setServoAngle(int deg) {
+    servoAngle = constrain(deg, SERVO_MIN_DEG, SERVO_MAX_DEG);
+    applyServo();
+}
+
+// ============================================================
+//  8. 訊息
+// ============================================================
+void printStatus() {
+    Serial.print("[狀態] ");
+    Serial.print(running ? "前進 (FORWARD)" : "停止 (STOP)");
+    Serial.print("  速度=");
+    Serial.print(speedSetting);
+    Serial.print(" (");
+    Serial.print(speedSetting * 100 / PWM_MAX);
+    Serial.print("%)  左=");
+    Serial.print(escL.mag);
+    Serial.print(" 右=");
+    Serial.print(escR.mag);
+    Serial.print("  俯仰角=");
+    Serial.print(servoAngle);
+    Serial.println("°");
+}
+
+void printHelp() {
+    Serial.println();
+    Serial.println("===== 無刷 ×2 + 伺服俯仰角 控制 =====");
+    Serial.println("  w / f    : 前進");
+    Serial.println("  x / 空白 : 停止");
+    Serial.println("  + / =    : 速度 +5%");
+    Serial.println("  - / _    : 速度 -5%");
+    Serial.println("  p        : 俯仰角 +5°");
+    Serial.println("  o        : 俯仰角 -5°");
+    Serial.println("  h / ?    : 顯示說明");
+    Serial.println("  註：無刷第一次使用需先做油門行程校正。");
+    Serial.println("=====================================");
+}
+
+// ============================================================
+//  9. 指令
+// ============================================================
+void setSpeed(int value) {
+    speedSetting = constrain(value, 0, PWM_MAX);
+    if(running) {
+        for(Esc* e : escs)
+            e->wantMag = speedSetting;
+        lastCommandMs = millis();
+    }
+    printStatus();
+}
+
+void handleCommand(char c) {
+    switch(c) {
+    case 'w':
+    case 'W':
+    case 'f':
+    case 'F':
+        running = true;
+        for(Esc* e : escs)
+            e->wantMag = speedSetting;
+        lastCommandMs = millis();
+        printStatus();
+        break;
+
+    case 'x':
+    case 'X':
+    case ' ':
+        running = false;
+        lastCommandMs = millis();
+        printStatus();
+        break;
+
+    case 'p':
+    case 'P':
+        setServoAngle(servoAngle + SERVO_STEP_DEG);
+        lastCommandMs = millis();
+        printStatus();
+        break;
+
+    case 'o':
+    case 'O':
+        setServoAngle(servoAngle - SERVO_STEP_DEG);
+        lastCommandMs = millis();
+        printStatus();
+        break;
+
+    case 'h':
+    case 'H':
+    case '?':
+        printHelp();
+        break;
+
+    case '+':
+    case '=':
+        setSpeed(speedSetting + PWM_MAX / 20);
+        break;
+
+    case '-':
+    case '_':
+        setSpeed(speedSetting - PWM_MAX / 20);
+        break;
+
+    default:
+        break;
+    }
+}
+
+// ============================================================
+//  10. Arduino
+// ============================================================
+void setup() {
+    // 先把 4 條訊號線接上並輸出「停止 / 正轉」，
+    // 這樣如果 ESC 和 Pico 同時上電，ESC 也能正常 arm。
+    escL.thr.attach(PIN_THR_L);
+    escL.rev.attach(PIN_REV_L);
+    escR.thr.attach(PIN_THR_R);
+    escR.rev.attach(PIN_REV_R);
+    stopAllOutputs();
+
+    // 伺服先回到中央角
+    pitchServo.attach(PIN_SERVO, SERVO_MIN_US, SERVO_MAX_US);
+    applyServo();
+
+    // 讓 ESC 有時間看到穩定的低油門訊號再 arm
+    delay(BOOT_ARM_DELAY_MS);
+
+    Serial.begin(115200);
+    delay(300);
+    printHelp();
+    Serial.println("提示：第一次使用請先確認油門行程已校正過。");
+    printStatus();
+}
+
+void loop() {
+    while(Serial.available() > 0) {
+        char c = (char)Serial.read();
+        if(c == '\n' || c == '\r')
+            continue;
+        handleCommand(c);
+    }
+
+    uint32_t now = millis();
+    if(now - lastRampMs >= RAMP_INTERVAL_MS) {
+        lastRampMs = now;
+        for(Esc* e : escs)
+            updateEsc(*e);
+    }
+
+    if(COMMAND_TIMEOUT_MS > 0 && running &&
+       now - lastCommandMs > COMMAND_TIMEOUT_MS) {
+        running = false;
+        Serial.println("[安全] 太久沒收到指令，自動停止");
+        printStatus();
+    }
+}

@@ -1,0 +1,40 @@
+超音波跨 Pico 通訊（115200 baud，CRC16 封包）
+
+新增兩條線，斷電後接線：
+  步進 Pico GP0（實體第1腳，TX） -> small_sweet Pico GP5（實體第7腳，RX）
+  步進 Pico GND                  -> small_sweet Pico GND
+  small_sweet GP4 是這組 UART 的未使用 TX，不要接到 bridge GP4。
+
+原有 DBR4 控制線保持：
+  bridge GP4 TX -> small_sweet GP1 RX
+  bridge GP4 TX -> 步進 Pico GP1 RX
+  所有 Pico 共地。
+
+US-100 維持接步進 Pico：
+  VCC -> 3V3，GND -> GND，Trig -> GP5，Echo -> GP6。
+  模式短針不跨接。保留使用者實測的 active-LOW 12us 觸發。
+
+行為：
+  CH7 中位：距離 <=173cm、無效讀值或 350ms 沒收到距離封包時，禁止前進分量。
+  CH7 中位：距離 >173cm 時允許所有方向。受阻時仍可後退、橫移與旋轉。
+  CH7 高位：底盤可向所有方向移動，不受測距限制。
+  CH7 低位：全車停止，伺服停止送出控制脈波。
+  解除後若遙控前進仍保持，底盤會重新平滑起步。
+  步進馬達不受超音波影響；正負方向相對上一版反轉，CH8仍為200脈波/秒。
+
+三顆 Pico 使用新版遙控封包，需重新編譯燒錄（保留 common 目錄）：
+  cd D:\ctrl_v_mix\dbr4_bridge
+  pio run -e dbr4_bridge -t upload
+  cd D:\ctrl_v_mix\pico_drv8825
+  pio run -e pico -t upload
+  cd D:\ctrl_v_mix\small_sweet
+  pio run -e four_motor_rc -t upload
+
+架空底盤或採低速安全測試：
+  small_sweet 監控 US_RX=1 表示收到有效格式的距離封包。
+  valid=1 表示感測器本次距離有效，DIST為公分。
+  先用50cm平板確認BLOCK且往前搖桿不前進，後退仍可動。
+  在 CH7 中位再用 >173cm 的有效讀值確認 CLEAR，允許前進。
+  在 CH7 中位拔掉距離訊號線，超過 350ms 後應顯示 US_RX=0、valid=0、BLOCK。
+  CH7 低位或橋接斷線後全車停止。USB 停止指令保留。
+  DIST為軟體輪詢讀取的原始距離，未套用參考程式45mm校正值。
